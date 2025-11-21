@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  trading-engine:
+    build: .
+    container_name: trading-engine
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - .env
+    depends_on:
+      - questdb
+    network_mode: host  # Pour la performance réseau (Linux) ou bridge
+
+  questdb:
+    image: questdb/questdb:latest
+    container_name: questdb
+    restart: always
+    ports:
+      - "9000:9000"   # REST API / Console
+      - "9009:9009"   # InfluxDB Line Protocol (TCP)
+      - "8812:8812"   # Postgres Wire Protocol
+    volumes:
+      - ./questdb_data:/root/.questdb/db
+    environment:
+      - QDB_TELEMETRY_ENABLED=false

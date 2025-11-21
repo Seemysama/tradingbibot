@@ -52,4 +52,6 @@ logs/
 # Export folders
 export/
 export_*/
-export.zip
+
+# QuestDB Data
+questdb_data/
