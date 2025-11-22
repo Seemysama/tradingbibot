@@ -98,57 +98,20 @@ async def api_command_listener(execution_engine: ExecutionEngine, aggregator: Ti
 
 async def pnl_broadcaster(engine: ExecutionEngine, aggregator: TimeBarAggregator):
     """
-    Tâche périodique qui diffuse le PnL et l'état du portefeuille.
+    Diffuse régulièrement le PnL en se basant sur les derniers marks.
     """
-    logger.info("💰 Démarrage du PnL Broadcaster (VERSION CORRIGÉE)...")
-    async with httpx.AsyncClient() as client:
-        while True:
-            try:
-                # Construction du payload PnL
-                total_pnl = 0.0
-                positions_data = []
-                
-                # Calcul du PnL non réalisé sur les positions ouvertes
-                positions_snapshot = list(engine.portfolio.positions.items())
-                for symbol, position in positions_snapshot:
-                    # On récupère le dernier prix connu via l'aggregator (ou le dernier tick)
-                    # Ici on simplifie en prenant le prix d'entrée si pas de prix live dispo (à améliorer)
-                    current_price = position.entry_price # Fallback
-                    if symbol in aggregator.active_candles:
-                        current_price = aggregator.active_candles[symbol]['c']
-                    
-                    # Correction: Utilisation de position.qty au lieu de position.quantity
-                    pnl = (current_price - position.entry_price) * position.qty if position.side == "BUY" else (position.entry_price - current_price) * position.qty
-                    total_pnl += pnl
-                    
-                    positions_data.append({
-                        "symbol": symbol,
-                        "side": position.side,
-                        "entry": position.entry_price,
-                        "mark": current_price,
-                        "pnl": pnl,
-                        "qty": position.qty # Correction ici aussi
-                    })
-
-                equity = engine.portfolio.balance + total_pnl
-                
-                payload = {
-                    "type": "pnl",
-                    "balance": engine.portfolio.balance,
-                    "equity": equity,
-                    "pnl_unrealized": total_pnl,
-                    "positions": positions_data,
-                    "timestamp": datetime.now().isoformat()
-                }
-
-                await client.post("http://localhost:8000/internal/broadcast", json=payload, timeout=1.0)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"❌ Erreur PnL Broadcast: {e}")
-            
-            await asyncio.sleep(1) # Mise à jour chaque seconde
+    logger.info("💰 Démarrage du PnL Broadcaster...")
+    while True:
+        try:
+            marks = {sym: c.get("c", c.get("close", 0.0)) for sym, c in aggregator.active_candles.items()}
+            for sym, px in marks.items():
+                engine.update_mark(sym, px)
+            await engine.broadcast_portfolio(price_hint=marks)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"❌ Erreur PnL Broadcast: {e}")
+        await asyncio.sleep(1)
 
 async def data_writer(queue: asyncio.Queue, db: QuestDBClient):
     """
@@ -260,7 +223,7 @@ async def aggregator_runner(input_queue: asyncio.Queue, aggregator: TimeBarAggre
     except Exception as e:
         logger.error(f"⚠️ Flush aggregator échoué: {e}")
 
-async def strategy_runner(candle_queue: asyncio.Queue, execution_queue: asyncio.Queue, strategy: HybridStrategy, learner: OnlineLearner):
+async def strategy_runner(candle_queue: asyncio.Queue, execution_queue: asyncio.Queue, strategy: HybridStrategy, learner: OnlineLearner, engine: ExecutionEngine):
     """
     Consommateur qui alimente la stratégie avec des bougies.
     """
@@ -272,6 +235,7 @@ async def strategy_runner(candle_queue: asyncio.Queue, execution_queue: asyncio.
             break
 
         try:
+            engine.update_mark(candle.symbol, candle.close)
             proba, ready = learner.on_candle(candle)
             signal = strategy.on_candle(candle)
             
@@ -312,7 +276,7 @@ async def execution_runner(execution_queue: asyncio.Queue, engine: ExecutionEngi
             break
 
         try:
-            await engine.execute(signal)
+            await engine.on_signal(signal)
         except Exception as e:
             logger.error(f"❌ Erreur Execution Runner: {e}")
         finally:
@@ -426,7 +390,10 @@ async def warmup_strategy(strategy: HybridStrategy, db_client: QuestDBClient, sy
                     volume=c_data['volume']
                 )
                 # Injection en mode backtest (pas de signal généré, pas de log)
-                strategy.on_candle(candle, is_backtest=True)
+                try:
+                    strategy.on_candle(candle)
+                except Exception:
+                    pass
             
             count = len(candles_data)
             total_loaded += count
@@ -464,7 +431,7 @@ async def main():
     aggregator = TimeBarAggregator(output_queue=candle_dispatch_queue)
     
     # Stratégie Hybride (SMA + ADX + ATR)
-    strategy = HybridStrategy(lookback_period=300)
+    strategy = HybridStrategy(lookback=300)
     learner = OnlineLearner()
     
     # --- WARMUP PHASE ---
@@ -473,10 +440,10 @@ async def main():
     
     # Execution Engine avec Money Management (Max 20% par trade)
     execution_engine = ExecutionEngine(
-        mode="PAPER", 
         initial_balance=10000.0,
-        max_position_pct=0.20 # Diversification: Max 5 positions
-    ) 
+        max_position_pct=0.20,
+        cooldown_ms=3000
+    )
 
     logger.info("⚡ Moteur initialisé (Mode: Asynchrone/uvloop)")
 
@@ -488,7 +455,7 @@ async def main():
         asyncio.create_task(aggregator_runner(agg_queue, aggregator), name="aggregator-runner"),
         asyncio.create_task(candle_dispatcher(candle_dispatch_queue, strategy_candle_queue, candle_store_queue), name="candle-dispatcher"),
         asyncio.create_task(candle_writer(candle_store_queue, db_client), name="candle-writer"),
-        asyncio.create_task(strategy_runner(strategy_candle_queue, execution_queue, strategy, learner), name="strategy-runner"),
+        asyncio.create_task(strategy_runner(strategy_candle_queue, execution_queue, strategy, learner, execution_engine), name="strategy-runner"),
         asyncio.create_task(execution_runner(execution_queue, execution_engine), name="execution-runner"),
         asyncio.create_task(api_command_listener(execution_engine, aggregator), name="api-command-listener"),
         asyncio.create_task(pnl_broadcaster(execution_engine, aggregator), name="pnl-broadcaster")
