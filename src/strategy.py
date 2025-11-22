@@ -1,11 +1,11 @@
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
-
-import numpy as np
 import pandas as pd
 
 from src.models import Candle, Signal
+from src.learning import OnlineLearner
+from src.config import Settings, load_config
 
 logger = logging.getLogger("HybridStrategy")
 
@@ -24,9 +24,13 @@ class HybridStrategy:
     - Sortie : SL = close -/+ 2*ATR, TP = close +/- 3*ATR.
     """
 
-    def __init__(self, lookback: int = 300):
+    def __init__(self, lookback: int = 300, learner: Optional[OnlineLearner] = None, settings: Optional[Settings] = None):
         self.lookback = lookback
         self.state: Dict[str, IndicatorState] = {}
+        self.learner = learner
+        self.settings = settings or load_config()
+        self.ml_enabled = getattr(self.settings, "ML_ENABLED", True)
+        self.ml_confidence = getattr(self.settings, "ML_MIN_CONFIDENCE", 0.6)
 
     def _get_state(self, symbol: str) -> IndicatorState:
         if symbol not in self.state:
@@ -57,7 +61,8 @@ class HybridStrategy:
         tr2 = (df["high"] - prev_close).abs()
         tr3 = (df["low"] - prev_close).abs()
         df["TR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        df["ATR"] = df["TR"].rolling(window=14).mean()
+        # ATR sur fenêtre glissante de 14 périodes
+        df["ATR"] = df["TR"].rolling(window=14, min_periods=14).mean()
 
         prev_high = df["high"].shift(1)
         prev_low = df["low"].shift(1)
@@ -77,13 +82,22 @@ class HybridStrategy:
 
         return df
 
-    def on_candle(self, candle: Candle) -> Optional[Signal]:
+    def on_candle(self, candle: Candle, is_backtest: bool = False) -> Optional[Signal]:
+        # Étape A (Mise à jour ML)
+        ml_proba = 0.5
+        ml_ready = False
+        if self.learner:
+            ml_proba, ml_ready = self.learner.on_candle(candle)
+
         state = self._get_state(candle.symbol)
         state.candles.append(candle)
         if len(state.candles) > self.lookback:
             state.candles.pop(0)
 
         if len(state.candles) < 201:
+            if not is_backtest:
+                count = len(state.candles)
+                logger.info(f"⏳ {candle.symbol}: Initialisation indicateurs... ({count}/201 bougies)")
             return None
 
         df = self._to_df(state.candles)
@@ -95,38 +109,74 @@ class HybridStrategy:
         if curr["ADX"] < 25:
             return None
 
-        # Tendance
-        is_uptrend = curr["close"] > curr["SMA200"]
-        is_downtrend = curr["close"] < curr["SMA200"]
-
-        signal_side: Optional[str] = None
-        reason = ""
-
-        # Croisement SMA5 / SMA20
-        if prev["SMA5"] <= prev["SMA20"] and curr["SMA5"] > curr["SMA20"] and is_uptrend:
-            signal_side = "BUY"
-            reason = f"Trend Long ADX={curr['ADX']:.1f}"
-        elif prev["SMA5"] >= prev["SMA20"] and curr["SMA5"] < curr["SMA20"] and is_downtrend:
-            signal_side = "SELL"
-            reason = f"Trend Short ADX={curr['ADX']:.1f}"
-        else:
-            return None
-
-        atr = curr["ATR"]
         price = curr["close"]
-        if signal_side == "BUY":
-            sl = price - 2 * atr
-            tp = price + 3 * atr
-        else:
-            sl = price + 2 * atr
-            tp = price - 3 * atr
+        atr_raw = curr["ATR"]
+        
+        # Étape B (Logique Tech) : Génération du signal technique
+        signal = None
+        
+        # Condition LONG : Cross UP + Tendance Hausse (Prix > SMA200)
+        if (prev["SMA5"] <= prev["SMA20"]) and (curr["SMA5"] > curr["SMA20"]):
+            if price > curr["SMA200"]:
+                sl_dist = 2.0 * atr_raw
+                tp_dist = 3.0 * atr_raw
+                signal = Signal(
+                    symbol=candle.symbol,
+                    side="BUY",
+                    price=price,
+                    timestamp=candle.timestamp,
+                    stop_loss=price - sl_dist,
+                    take_profit=price + tp_dist,
+                    reason=f"Trend Following LONG (ADX={curr['ADX']:.1f})"
+                )
+            else:
+                if not is_backtest:
+                    logger.info(f"🛡️ Signal LONG ignoré {candle.symbol}: Contre-tendance (Prix < SMA200)")
 
-        return Signal(
-            symbol=candle.symbol,
-            side=signal_side,
-            price=price,
-            timestamp=candle.timestamp,
-            reason=reason,
-            stop_loss=sl,
-            take_profit=tp,
-        )
+        # Condition SHORT : Cross DOWN + Tendance Baisse (Prix < SMA200)
+        elif (prev["SMA5"] >= prev["SMA20"]) and (curr["SMA5"] < curr["SMA20"]):
+            if price < curr["SMA200"]:
+                sl_dist = 2.0 * atr_raw
+                tp_dist = 3.0 * atr_raw
+                signal = Signal(
+                    symbol=candle.symbol,
+                    side="SELL",
+                    price=price,
+                    timestamp=candle.timestamp,
+                    stop_loss=price + sl_dist,
+                    take_profit=price - tp_dist,
+                    reason=f"Trend Following SHORT (ADX={curr['ADX']:.1f})"
+                )
+            else:
+                if not is_backtest:
+                    logger.info(f"🛡️ Signal SHORT ignoré {candle.symbol}: Contre-tendance (Prix > SMA200)")
+
+        # Étape C (Filtrage/Fusion) : Validation par le ML
+        if signal and self.ml_enabled and self.learner:
+            # Si le ML n'est pas prêt, on laisse passer (Fallback classique)
+            if not ml_ready:
+                if not is_backtest:
+                    logger.info(f"⚠️ ML Not Ready ({self.learner.train_counts.get(candle.symbol, 0)} samples) - Signal {signal.side} accepté par défaut.")
+                return signal
+
+            min_conf = self.ml_confidence
+            is_valid = True
+            
+            if signal.side == "BUY":
+                # On veut une proba de hausse forte
+                if ml_proba < min_conf:
+                    is_valid = False
+            elif signal.side == "SELL":
+                # On veut une proba de hausse faible (donc proba baisse forte)
+                if ml_proba > (1.0 - min_conf):
+                    is_valid = False
+            
+            if not is_valid:
+                if not is_backtest:
+                    logger.info(f"🛡️ ML VETO: Signal {signal.side} bloqué sur {signal.symbol} (Proba={ml_proba:.2f})")
+                return None
+            else:
+                if not is_backtest:
+                    logger.info(f"✅ ML CONFIRM: Signal {signal.side} validé sur {signal.symbol} (Proba={ml_proba:.2f})")
+
+        return signal

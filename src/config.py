@@ -16,7 +16,12 @@ class Settings:
     BINANCE_API_SECRET: str
     QUESTDB_HOST: str
     QUESTDB_PORT: int
-    SYMBOLS: list[str]  # Ajout de la liste des symboles
+    SYMBOLS: list[str]
+
+    # Machine Learning Settings
+    ML_ENABLED: bool = True
+    ML_MIN_CONFIDENCE: float = 0.6
+    ML_MIN_SAMPLES: int = 1000
 
 def load_config() -> Settings:
     """
@@ -47,7 +52,10 @@ def load_config() -> Settings:
             BINANCE_API_SECRET=binance_secret,
             QUESTDB_HOST=questdb_host,
             QUESTDB_PORT=questdb_port,
-            SYMBOLS=symbols
+            SYMBOLS=symbols,
+            ML_ENABLED=os.getenv("ML_ENABLED", "true").lower() == "true",
+            ML_MIN_CONFIDENCE=float(os.getenv("ML_MIN_CONFIDENCE", "0.6")),
+            ML_MIN_SAMPLES=int(os.getenv("ML_MIN_SAMPLES", "1000"))
         )
 
     except Exception as e:

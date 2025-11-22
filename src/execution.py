@@ -1,7 +1,10 @@
 import asyncio
+import json
 import logging
+import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Dict, Literal, Optional
 
 from core.sizing import PositionSizer
@@ -44,12 +47,15 @@ class ExecutionEngine:
     """
 
     def __init__(self, initial_balance: float = 10_000.0, max_position_pct: float = 0.20, cooldown_ms: int = 3000):
-        self.portfolio = Portfolio(balance=initial_balance)
         self.initial_balance = initial_balance
         self.max_position_pct = max_position_pct
         self.cooldown_ms = cooldown_ms
         self._last_exec_ts: Dict[str, float] = {}
         self._marks: Dict[str, float] = {}
+        self.state_path = Path("data") / "portfolio_state.json"
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.portfolio = Portfolio(balance=initial_balance)
+        self._load_state()
 
     # -------------------- API publique -------------------- #
     async def on_signal(self, signal: Signal):
@@ -98,6 +104,57 @@ class ExecutionEngine:
         """Met à jour le prix de référence pour le mark-to-market."""
         self._marks[symbol] = price
 
+    # -------------------- Persistance -------------------- #
+    def _load_state(self):
+        if not self.state_path.exists():
+            return
+        try:
+            with self.state_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            balance = float(data.get("balance", self.initial_balance))
+            positions_raw = data.get("positions", {})
+            positions: Dict[str, Position] = {}
+            for sym, p in positions_raw.items():
+                try:
+                    positions[sym] = Position(
+                        symbol=sym,
+                        side=p["side"],
+                        entry_price=float(p["entry_price"]),
+                        qty=float(p["qty"]),
+                        timestamp=float(p.get("timestamp", time.time())),
+                        stop_loss=float(p.get("stop_loss", 0.0)),
+                        take_profit=float(p.get("take_profit", 0.0)),
+                    )
+                except Exception as e:
+                    logger.warning(f"⚠️ Position corrompue ignorée ({sym}): {e}")
+            self.portfolio = Portfolio(balance=balance, positions=positions)
+            logger.info(f"♻️ État restauré : Balance={balance:.2f}, Positions={len(positions)}")
+        except Exception as e:
+            logger.warning(f"⚠️ Impossible de charger l'état du portefeuille: {e}")
+
+    def _save_state(self):
+        try:
+            payload = {
+                "balance": self.portfolio.balance,
+                "positions": {
+                    sym: {
+                        "side": pos.side,
+                        "entry_price": pos.entry_price,
+                        "qty": pos.qty,
+                        "timestamp": pos.timestamp,
+                        "stop_loss": pos.stop_loss,
+                        "take_profit": pos.take_profit,
+                    }
+                    for sym, pos in self.portfolio.positions.items()
+                },
+            }
+            tmp_path = self.state_path.with_suffix(".json.tmp")
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp_path, self.state_path)
+        except Exception as e:
+            logger.warning(f"⚠️ Sauvegarde d'état échouée: {e}")
+
     # -------------------- Internes -------------------- #
     def check_min_notional(self, price: float, qty: float) -> bool:
         return price * qty >= 5.0
@@ -130,10 +187,12 @@ class ExecutionEngine:
 
         await broadcast_json("trade", {"type": "trade", "symbol": symbol, "side": side, "price": price, "qty": qty})
         logger.info(f"💰 OUVERTURE {pos_side} {symbol} Qty={qty} @ {price}")
+        self._save_state()
 
     async def _close_position(self, symbol: str, price: float):
         pos = self.portfolio.positions.pop(symbol)
         qty = pos.qty
+        # PnL strict : LONG = (exit - entry) * qty, SHORT = (entry - exit) * qty
         pnl = (price - pos.entry_price) * qty if pos.side == "LONG" else (pos.entry_price - price) * qty
 
         # Restitution du cash et PnL
@@ -141,6 +200,7 @@ class ExecutionEngine:
 
         await broadcast_json("trade", {"type": "trade", "symbol": symbol, "side": f"CLOSE_{pos.side}", "price": price, "qty": qty, "pnl": pnl})
         logger.info(f"🔔 FERMETURE {pos.side} {symbol} Qty={qty} @ {price} | PnL={pnl:.2f}")
+        self._save_state()
 
     def _compute_equity(self, price_hint: Optional[Dict[str, float]] = None):
         price_hint = price_hint or {}
@@ -150,6 +210,7 @@ class ExecutionEngine:
 
         for sym, pos in self.portfolio.positions.items():
             mark = price_hint.get(sym) or self._marks.get(sym) or pos.entry_price
+            # PnL strict : LONG = (mark - entry) * qty, SHORT = (entry - mark) * qty
             unrealized = (mark - pos.entry_price) * pos.qty if pos.side == "LONG" else (pos.entry_price - mark) * pos.qty
             total_unrealized += unrealized
 
@@ -178,4 +239,3 @@ class ExecutionEngine:
             "timestamp": time.time(),
         }
         await broadcast_json("pnl", payload)
-

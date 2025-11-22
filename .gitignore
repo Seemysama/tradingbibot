@@ -55,3 +55,6 @@ export_*/
 
 # QuestDB Data
 questdb_data/
+
+# Local Data
+data/

@@ -4,6 +4,7 @@ import uvloop
 import logging
 import websockets
 import httpx
+from typing import Optional
 from datetime import datetime
 from src import config
 from src.database import QuestDBClient
@@ -223,7 +224,7 @@ async def aggregator_runner(input_queue: asyncio.Queue, aggregator: TimeBarAggre
     except Exception as e:
         logger.error(f"⚠️ Flush aggregator échoué: {e}")
 
-async def strategy_runner(candle_queue: asyncio.Queue, execution_queue: asyncio.Queue, strategy: HybridStrategy, learner: OnlineLearner, engine: ExecutionEngine):
+async def strategy_runner(candle_queue: asyncio.Queue, execution_queue: asyncio.Queue, strategy: HybridStrategy):
     """
     Consommateur qui alimente la stratégie avec des bougies.
     """
@@ -231,38 +232,18 @@ async def strategy_runner(candle_queue: asyncio.Queue, execution_queue: asyncio.
     while True:
         try:
             candle = await candle_queue.get()
-        except asyncio.CancelledError:
-            break
-
-        try:
-            engine.update_mark(candle.symbol, candle.close)
-            proba, ready = learner.on_candle(candle)
             signal = strategy.on_candle(candle)
             
             if signal:
-                allow = True
-                if ready and proba is not None:
-                    if signal.side == "BUY":
-                        allow = proba >= learner.prob_buy
-                    elif signal.side == "SELL":
-                        allow = proba <= learner.prob_sell
-
-                    if not allow:
-                        logger.info(
-                            f"🛡️ ML VETO {signal.symbol}: {signal.side} bloqué (p_up={proba:.2f})"
-                        )
-                    else:
-                        logger.info(
-                            f"✅ Concordance ML {signal.symbol}: {signal.side} validé (p_up={proba:.2f})"
-                        )
-
-                if allow:
-                    await execution_queue.put(signal)
-                    logger.info(f"⚡ SIGNAL {signal.side} @ {signal.price}$ | {signal.symbol} | {signal.reason}")
+                # On pousse le signal vers l'exécution au lieu de juste logger
+                await execution_queue.put(signal)
+                logger.info(f"⚡ SIGNAL {signal.side} @ {signal.price}$ | {signal.symbol} | {signal.reason}")
+            
+            candle_queue.task_done()
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.error(f"❌ Erreur Strategy Runner: {e}")
-        finally:
-            candle_queue.task_done()
 
 async def execution_runner(execution_queue: asyncio.Queue, engine: ExecutionEngine):
     """
@@ -363,46 +344,37 @@ async def candle_dispatcher(
 
     logger.info("🪄 Candle Dispatcher arrêté.")
 
-async def warmup_strategy(strategy: HybridStrategy, db_client: QuestDBClient, symbols: list[str]):
+async def warmup_strategy(strategy: HybridStrategy, learner: OnlineLearner, db_client: QuestDBClient, symbols: list[str]):
     """
-    Préchauffe la stratégie en chargeant les données historiques depuis QuestDB.
+    Préchauffe la Stratégie (SMA) ET le Machine Learning (Learner).
     """
-    logger.info("🔥 Démarrage du Warm-up (Préchauffage) de la stratégie...")
-    
-    total_loaded = 0
+    logger.info("🔥 Démarrage du Warm-up Neuro-Symbolique...")
+    total = 0
     for symbol in symbols:
         try:
-            # On récupère un peu plus que nécessaire pour être sûr d'avoir assez pour la SMA200
-            candles_data = await db_client.get_recent_candles(symbol, limit=300)
-            
+            # On charge assez d'historique pour que le ML apprenne (ex: 2000 bougies)
+            candles_data = await db_client.get_recent_candles(symbol, limit=2000)
             if not candles_data:
-                logger.warning(f"⚠️ Pas d'historique trouvé pour {symbol} dans QuestDB. Démarrage à froid.")
                 continue
-                
+            
+            logger.info(f"⏳ Entraînement rapide sur {len(candles_data)} bougies pour {symbol}...")
+            
             for c_data in candles_data:
                 candle = Candle(
                     symbol=c_data['symbol'],
                     timestamp=c_data['timestamp'],
-                    open=c_data['open'],
-                    high=c_data['high'],
-                    low=c_data['low'],
-                    close=c_data['close'],
-                    volume=c_data['volume']
+                    open=c_data['open'], high=c_data['high'], low=c_data['low'], close=c_data['close'], volume=c_data['volume']
                 )
-                # Injection en mode backtest (pas de signal généré, pas de log)
-                try:
-                    strategy.on_candle(candle)
-                except Exception:
-                    pass
+                # 1. Entraîner le ML
+                learner.on_candle(candle)
+                # 2. Initialiser les indicateurs techniques
+                strategy.on_candle(candle, is_backtest=True)
             
-            count = len(candles_data)
-            total_loaded += count
-            logger.info(f"✅ {symbol}: {count} bougies chargées depuis la DB.")
-            
+            total += len(candles_data)
         except Exception as e:
-            logger.error(f"❌ Erreur Warm-up pour {symbol}: {e}")
-
-    logger.info(f"🔥 Warm-up terminé. {total_loaded} bougies injectées au total.")
+            logger.error(f"❌ Erreur Warmup {symbol}: {e}")
+    
+    logger.info(f"✅ Warm-up terminé. Cerveau IA entraîné sur {total} points.")
 
 async def main():
     """
@@ -412,31 +384,37 @@ async def main():
     
     # 1. Configuration
     settings = config.load_config()
+    config.config = settings # Injection de la config globale pour la stratégie
     logger.info(f"✅ Configuration chargée. QuestDB cible: {settings.QUESTDB_HOST}:{settings.QUESTDB_PORT}")
 
     # 2. Queues (Communication Inter-Processus)
-    dispatch_queue = asyncio.Queue(maxsize=TICK_QUEUE_SIZE)
-    db_queue = asyncio.Queue(maxsize=TICK_QUEUE_SIZE)
-    agg_queue = asyncio.Queue(maxsize=TICK_QUEUE_SIZE)
-
-    candle_dispatch_queue = asyncio.Queue(maxsize=CANDLE_QUEUE_SIZE)
-    strategy_candle_queue = asyncio.Queue(maxsize=CANDLE_QUEUE_SIZE)
-    candle_store_queue = asyncio.Queue(maxsize=CANDLE_QUEUE_SIZE)
-
-    execution_queue = asyncio.Queue(maxsize=EXECUTION_QUEUE_SIZE)
+    raw_tick_queue = asyncio.Queue()
+    db_queue = asyncio.Queue()
+    agg_queue = asyncio.Queue()
+    candle_queue = asyncio.Queue()
+    strategy_candle_queue = asyncio.Queue()
+    candle_store_queue = asyncio.Queue()
+    execution_queue = asyncio.Queue()
 
     # 3. Composants
     db_client = QuestDBClient(host=settings.QUESTDB_HOST, port=settings.QUESTDB_PORT)
-    ingestor = BinanceIngestor(symbols=settings.SYMBOLS, output_queue=dispatch_queue)
-    aggregator = TimeBarAggregator(output_queue=candle_dispatch_queue)
+    ingestor = BinanceIngestor(symbols=settings.SYMBOLS, output_queue=raw_tick_queue)
+    aggregator = TimeBarAggregator(output_queue=candle_queue)
     
-    # Stratégie Hybride (SMA + ADX + ATR)
-    strategy = HybridStrategy(lookback=300)
-    learner = OnlineLearner()
+    # Module ML (Instancié AVANT la stratégie)
+    learner = OnlineLearner(
+        lookback=50,
+        min_train_samples=settings.ML_MIN_SAMPLES,
+        prob_buy=settings.ML_MIN_CONFIDENCE,
+        prob_sell=1.0 - settings.ML_MIN_CONFIDENCE
+    )
+    
+    # Stratégie Hybride (SMA + ADX + ATR) + ML
+    strategy = HybridStrategy(lookback=300, learner=learner)
     
     # --- WARMUP PHASE ---
-    # On préchauffe la stratégie AVANT de lancer les consommateurs temps réel
-    await warmup_strategy(strategy, db_client, settings.SYMBOLS)
+    # On préchauffe la stratégie ET le ML avec l'historique
+    await warmup_strategy(strategy, learner, db_client, settings.SYMBOLS)
     
     # Execution Engine avec Money Management (Max 20% par trade)
     execution_engine = ExecutionEngine(
@@ -450,12 +428,12 @@ async def main():
     # 4. Lancement des Tâches
     tasks = [
         asyncio.create_task(ingestor.run(), name="ws-ingestor"),
-        asyncio.create_task(fanout_dispatcher(dispatch_queue, db_queue, agg_queue, TICKER_SAMPLE_RATE), name="fanout-dispatcher"),
+        asyncio.create_task(fanout_dispatcher(raw_tick_queue, db_queue, agg_queue, TICKER_SAMPLE_RATE), name="fanout-dispatcher"),
         asyncio.create_task(data_writer(db_queue, db_client), name="questdb-writer"),
         asyncio.create_task(aggregator_runner(agg_queue, aggregator), name="aggregator-runner"),
-        asyncio.create_task(candle_dispatcher(candle_dispatch_queue, strategy_candle_queue, candle_store_queue), name="candle-dispatcher"),
+        asyncio.create_task(candle_dispatcher(candle_queue, strategy_candle_queue, candle_store_queue), name="candle-dispatcher"),
         asyncio.create_task(candle_writer(candle_store_queue, db_client), name="candle-writer"),
-        asyncio.create_task(strategy_runner(strategy_candle_queue, execution_queue, strategy, learner, execution_engine), name="strategy-runner"),
+        asyncio.create_task(strategy_runner(strategy_candle_queue, execution_queue, strategy), name="strategy-runner"),
         asyncio.create_task(execution_runner(execution_queue, execution_engine), name="execution-runner"),
         asyncio.create_task(api_command_listener(execution_engine, aggregator), name="api-command-listener"),
         asyncio.create_task(pnl_broadcaster(execution_engine, aggregator), name="pnl-broadcaster")
