@@ -1,9 +1,12 @@
 import asyncio
+import json
 import logging
-import orjson
+import time
 import websockets
 from asyncio import Queue, QueueFull
-from typing import List, Union
+from typing import List, Union, Optional
+
+from src.config import config
 
 logger = logging.getLogger("Ingestor")
 
@@ -11,6 +14,7 @@ class BinanceIngestor:
     """
     Ingestor WebSocket pour Binance Futures.
     Se connecte au flux 'aggTrade' et pousse les données normalisées dans une Queue.
+    Inclut un mécanisme de Watchdog pour détecter les gels de flux.
     """
 
     def __init__(self, symbols: List[str], output_queue: Queue):
@@ -19,6 +23,7 @@ class BinanceIngestor:
         self.base_url = "wss://fstream.binance.com/stream?streams="
         self.running = False
         self._queue_full_logged = False
+        self.last_message_time = 0.0
 
     def _build_url(self) -> str:
         """Construit l'URL WebSocket pour s'abonner à tous les symboles."""
@@ -38,13 +43,24 @@ class BinanceIngestor:
             try:
                 async with websockets.connect(url) as ws:
                     logger.info("✅ WebSocket connecté.")
+                    self.last_message_time = time.time()
                     backoff = 1 # Reset backoff on success
                     
-                    async for message in ws:
-                        if not self.running:
-                            break
-                        await self._process_message(message)
-                        
+                    # Lancement du Watchdog en parallèle
+                    watchdog_task = asyncio.create_task(self._watchdog(ws))
+                    
+                    try:
+                        async for message in ws:
+                            if not self.running:
+                                break
+                            await self._process_message(message)
+                            self.last_message_time = time.time()
+                            
+                    except websockets.ConnectionClosed:
+                        logger.warning("⚠️ Déconnexion WebSocket. Reconnexion...")
+                    finally:
+                        watchdog_task.cancel()
+
             except (websockets.ConnectionClosed, asyncio.TimeoutError, OSError) as e:
                 logger.warning(f"⚠️ Déconnexion WebSocket ({e}). Reconnexion dans {backoff}s...")
                 await asyncio.sleep(backoff)
@@ -58,6 +74,17 @@ class BinanceIngestor:
         
         self.running = False
         logger.info("🛑 Ingestor arrêté.")
+
+    async def _watchdog(self, ws):
+        """Surveille le silence radio."""
+        while self.running:
+            await asyncio.sleep(1)
+            silence_duration = time.time() - self.last_message_time
+            
+            if silence_duration > config.WATCHDOG_TIMEOUT:
+                logger.error(f"🚨 WATCHDOG: No data for {silence_duration:.1f}s. Resetting connection.")
+                await ws.close()
+                return
 
     async def _process_message(self, raw_msg: Union[str, bytes]):
         """

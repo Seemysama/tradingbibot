@@ -48,55 +48,46 @@ class LogManager:
                 print(f"⚠️ Erreur Broadcast (Ignorée): {e}")
                 self.disconnect(connection)
 
-    async def broadcast_event(self, event_type: str, data: dict):
-        """
-        Diffuse un événement structuré JSON.
-        """
-        payload = {"type": event_type, **data}
-        message = json.dumps(payload)
-        await self.broadcast(message)
-
-log_manager = LogManager()
-
-async def broadcast_log(message: str):
-    """
-    Diffuse un log.
-    - Si nous sommes le serveur (connexions actives), on diffuse via WebSocket.
-    - Si nous sommes le bot (pas de connexions), on envoie au serveur via HTTP.
-    """
-    if log_manager.active_connections:
-        await log_manager.broadcast(message)
-    else:
-        # Fallback: Envoi au serveur API si on est dans un processus séparé (ex: main.py)
-        try:
-            async with httpx.AsyncClient() as client:
-                # On envoie un JSON avec le champ "message"
-                # Le serveur attend un LogMessage(message: str) ou un dict générique
-                # Le endpoint /internal/broadcast attend un Dict[str, Any]
-                # Si on veut que ça apparaisse comme un log dans l'UI, il faut que le type soit "log"
-                # Le serveur fait: await log_manager.broadcast(json.dumps(payload))
-                # L'UI attend: if msg_type == "log" ... txt = data.get("message")
-                
-                payload = {
-                    "type": "log",
-                    "message": message
-                }
-                await client.post(f"{API_URL}/internal/broadcast", json=payload, timeout=1.0)
-        except Exception:
-            # Si le serveur est éteint, on ignore silencieusement pour ne pas bloquer le bot
-            pass
-
 class BroadcastLogHandler(logging.Handler):
-    """Handler de logs qui diffuse via WebSocket/HTTP"""
+    """
+    Handler de logs custom qui envoie les logs vers l'API via HTTP POST.
+    Utilisé pour afficher les logs dans l'interface graphique.
+    """
     def emit(self, record):
         try:
-            msg = self.format(record)
-            # On tente de récupérer la boucle courante pour envoyer en async
+            log_entry = self.format(record)
+            # On utilise httpx en mode "fire and forget" (asyncio.create_task)
+            # pour ne pas bloquer le thread principal du bot
             try:
                 loop = asyncio.get_running_loop()
                 if loop.is_running():
-                    loop.create_task(broadcast_log(msg))
+                    loop.create_task(self._send_log(log_entry))
             except RuntimeError:
-                pass # Pas de boucle active
+                # Pas de boucle d'événements active (ex: démarrage)
+                pass
         except Exception:
             self.handleError(record)
+
+    async def _send_log(self, message: str):
+        try:
+            async with httpx.AsyncClient(timeout=1.0) as client:
+                await client.post(f"{API_URL}/logs", json={"message": message})
+        except Exception:
+            # On ignore les erreurs de connexion à l'API pour ne pas crasher le bot
+            pass
+
+async def broadcast_event(event_type: str, data: dict):
+    """
+    Envoie un événement structuré (JSON) au serveur API pour diffusion WebSocket.
+    """
+    try:
+        payload = {
+            "type": event_type,
+            "data": data,
+            "timestamp": int(asyncio.get_event_loop().time() * 1000)
+        }
+        async with httpx.AsyncClient(timeout=0.5) as client:
+            await client.post(f"{API_URL}/events", json=payload)
+    except Exception as e:
+        # Fail silently pour ne pas bloquer le trading
+        pass

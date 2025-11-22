@@ -14,7 +14,7 @@ from src.strategy import HybridStrategy
 from src.execution import ExecutionEngine
 from src.models import Signal, Candle
 from src.learning import OnlineLearner
-from core.logger import BroadcastLogHandler
+from src.utils import BroadcastLogHandler
 
 # Configuration du logging
 logging.basicConfig(

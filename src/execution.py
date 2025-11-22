@@ -7,12 +7,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, Literal, Optional
 
-from core.sizing import PositionSizer
+from src.risk_management import PositionSizer
 from src.models import Signal
 
 try:
     # Préférence : payload structuré
-    from core.logger import broadcast_event as broadcast_json
+    from src.utils import broadcast_event as broadcast_json
 except Exception:  # pragma: no cover - fallback défensif
     async def broadcast_json(event_type: str, data: dict):
         pass

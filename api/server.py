@@ -1,10 +1,11 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from pydantic import BaseModel
-from core.logger import log_manager
+from src.utils import LogManager
 import asyncio
 from typing import Optional, Dict, Any
 
 app = FastAPI()
+log_manager = LogManager()
 
 # --- Modèles de Données ---
 class LogMessage(BaseModel):
