@@ -76,3 +76,27 @@ class TimeBarAggregator:
         )
         # Push non-bloquant (ou await si la queue est pleine, ici await par sécurité)
         await self.output_queue.put(candle)
+
+    async def flush_open_candles(self):
+        """
+        Force l'émission des bougies en cours (utile lors d'un arrêt propre).
+        """
+        for symbol in list(self.active_candles.keys()):
+            try:
+                c = self.active_candles[symbol]
+                candle = Candle(
+                    symbol=c['symbol'],
+                    timestamp=c['start'],
+                    open=c['o'],
+                    high=c['h'],
+                    low=c['l'],
+                    close=c['c'],
+                    volume=c['v']
+                )
+                try:
+                    self.output_queue.put_nowait(candle)
+                except asyncio.QueueFull:
+                    logger.warning(f"⚠️ Queue pleine, bougie {symbol} ignorée pendant le flush.")
+            except Exception as e:
+                logger.error(f"❌ Erreur lors du flush de {symbol}: {e}")
+        self.active_candles.clear()

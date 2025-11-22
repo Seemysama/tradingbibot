@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import time
 from typing import Optional
 from src.config import Settings
 
@@ -73,6 +72,24 @@ class QuestDBClient:
                     # On force la fermeture pour déclencher une reconnexion au prochain appel
                     self.close()
 
+    async def send_ohlcv(self, table: str, symbol: str, open: float, high: float, low: float, close: float, volume: float, timestamp_ms: int):
+        """
+        Envoie une bougie (OHLCV) au format ILP.
+        """
+        timestamp_ns = timestamp_ms * 1_000_000
+        # Tags: symbol
+        # Fields: open, high, low, close, volume
+        line = f"{table},symbol={symbol} open={open},high={high},low={low},close={close},volume={volume} {timestamp_ns}\n"
+        
+        async with self._lock:
+            await self._ensure_connection()
+            if self.writer:
+                try:
+                    self.writer.write(line.encode('utf-8'))
+                except Exception as e:
+                    logger.error(f"❌ Erreur d'écriture ILP (OHLCV): {e}")
+                    self.close()
+
     def close(self):
         """Ferme proprement la connexion."""
         if self.writer:
@@ -80,5 +97,80 @@ class QuestDBClient:
                 self.writer.close()
             except Exception:
                 pass
-            self.writer = None
-            self.reader = None
+
+    async def get_recent_candles(self, symbol: str, limit: int = 300) -> list[dict]:
+        """
+        Récupère les dernières bougies via REST.
+        Priorité: table de bougies (candles_1s), sinon fallback en échantillonnant les trades.
+        """
+        import httpx
+
+        normalized_symbol = symbol.replace("/", "")
+        rest_url = f"http://{self.host}:9000/exec"
+
+        def _map_rows(data) -> list[dict]:
+            cols = [c["name"] for c in data["columns"]]
+            candles = []
+            for row in reversed(data["dataset"]):  # dataset est DESC
+                row_dict = dict(zip(cols, row))
+                ts_val = row_dict["timestamp"]
+                ts_ms = 0
+                if isinstance(ts_val, str):
+                    from datetime import datetime
+                    try:
+                        dt = datetime.fromisoformat(ts_val.replace('Z', '+00:00'))
+                        ts_ms = int(dt.timestamp() * 1000)
+                    except Exception:
+                        pass
+                elif isinstance(ts_val, (int, float)):
+                    ts_ms = int(ts_val / 1000)
+
+                candles.append({
+                    "symbol": row_dict.get("symbol", normalized_symbol),
+                    "timestamp": ts_ms,
+                    "open": float(row_dict["open"]),
+                    "high": float(row_dict["high"]),
+                    "low": float(row_dict["low"]),
+                    "close": float(row_dict["close"]),
+                    "volume": float(row_dict["volume"])
+                })
+            return candles
+
+        async def _exec_query(client: httpx.AsyncClient, query: str) -> list[dict]:
+            resp = await client.get(rest_url, params={"query": query})
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("dataset"):
+                return []
+            return _map_rows(data)
+
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                # 1) Tentative sur la table de bougies (si alimentée)
+                query_candles = (
+                    f"SELECT * FROM candles_1s "
+                    f"WHERE symbol='{normalized_symbol}' "
+                    f"ORDER BY timestamp DESC LIMIT {limit}"
+                )
+                candles = await _exec_query(client, query_candles)
+                if candles:
+                    return candles
+
+                # 2) Fallback: reconstituer des bougies à partir des trades
+                query_trades = (
+                    "SELECT timestamp, "
+                    "first(price) AS open, "
+                    "max(price) AS high, "
+                    "min(price) AS low, "
+                    "last(price) AS close, "
+                    "sum(qty) AS volume "
+                    f"FROM trades WHERE symbol='{normalized_symbol}' "
+                    "SAMPLE BY 1s ALIGN TO CALENDAR "
+                    "ORDER BY timestamp DESC "
+                    f"LIMIT {limit}"
+                )
+                return await _exec_query(client, query_trades)
+
+        except Exception as e:
+            logger.warning(f"⚠️ Impossible de charger l'historique pour {symbol} depuis QuestDB: {e}")
+            return []

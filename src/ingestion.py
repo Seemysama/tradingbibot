@@ -2,9 +2,8 @@ import asyncio
 import logging
 import orjson
 import websockets
-from asyncio import Queue
+from asyncio import Queue, QueueFull
 from typing import List, Union
-from src.config import Settings
 
 logger = logging.getLogger("Ingestor")
 
@@ -19,6 +18,7 @@ class BinanceIngestor:
         self.queue = output_queue
         self.base_url = "wss://fstream.binance.com/stream?streams="
         self.running = False
+        self._queue_full_logged = False
 
     def _build_url(self) -> str:
         """Construit l'URL WebSocket pour s'abonner à tous les symboles."""
@@ -49,9 +49,15 @@ class BinanceIngestor:
                 logger.warning(f"⚠️ Déconnexion WebSocket ({e}). Reconnexion dans {backoff}s...")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30) # Max 30s wait
+            except asyncio.CancelledError:
+                logger.info("🛑 Arrêt de l'ingestor WebSocket demandé.")
+                break
             except Exception as e:
                 logger.error(f"❌ Erreur inattendue dans l'ingestor: {e}")
                 await asyncio.sleep(5)
+        
+        self.running = False
+        logger.info("🛑 Ingestor arrêté.")
 
     async def _process_message(self, raw_msg: Union[str, bytes]):
         """
@@ -79,8 +85,14 @@ class BinanceIngestor:
                 'timestamp': data['T'] # Milliseconds
             }
             
-            # Push non-bloquant dans la queue
-            self.queue.put_nowait(normalized_data)
+            try:
+                await self.queue.put(normalized_data)
+                self._queue_full_logged = False
+            except QueueFull:
+                # Backpressure soft : on droppe le tick le plus récent pour éviter l'OOM
+                if not self._queue_full_logged:
+                    logger.warning("⚠️ File d'ingestion pleine, tick ignoré.")
+                    self._queue_full_logged = True
             
         except orjson.JSONDecodeError:
             logger.error("❌ Erreur de parsing JSON")
